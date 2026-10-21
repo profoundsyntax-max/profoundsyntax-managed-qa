@@ -35,7 +35,7 @@ permissions:
 jobs:
   managed-qa:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 50
     steps:
       - name: Run ProfoundSyntax managed QA
         shell: bash
@@ -54,9 +54,11 @@ jobs:
           import re
           import shutil
           import subprocess
+          import tarfile
           import tempfile
           import urllib.parse
           import urllib.request
+          import zipfile
 
           handshake_url = "https://profoundsyntax.com/wp-json/profoundsyntax-community/v1/qa-builder/v2/managed/github/handshake"
           result_url = "https://profoundsyntax.com/wp-json/profoundsyntax-community/v1/qa-builder/v2/managed/github/result"
@@ -82,7 +84,7 @@ jobs:
                   headers={
                       "Authorization": "Bearer " + oidc,
                       "Content-Type": "application/json",
-                      "User-Agent": "ProfoundSyntax-Managed-QA/2.0",
+                      "User-Agent": "ProfoundSyntax-Managed-QA/3.0",
                   },
               )
               with urllib.request.urlopen(req, timeout=45) as response:
@@ -103,6 +105,90 @@ jobs:
               if len(data) < 8 or data[:4] != b"\x00asm":
                   sample = data[:12].hex() if data else "empty"
                   raise RuntimeError("Generated artifact is not a WebAssembly module (bytes=" + str(len(data)) + ", head=" + sample + ")")
+
+          def http_json(url, timeout=60):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "User-Agent": "ProfoundSyntax-Managed-QA/3.0",
+                      "X-GitHub-Api-Version": "2026-03-10",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  return json.load(response)
+
+          def download(url, path, timeout=1800):
+              path = pathlib.Path(path)
+              path.parent.mkdir(parents=True, exist_ok=True)
+              run(["curl", "--fail", "--location", "--retry", "3", "--retry-all-errors", "--silent", "--show-error", "--output", str(path), url], timeout=timeout)
+              if not path.exists() or path.stat().st_size <= 0:
+                  raise RuntimeError("Download produced an empty artifact: " + path.name)
+              return path
+
+          def github_release_asset(repo, tag, asset_name, dest, timeout=1800):
+              release = http_json("https://api.github.com/repos/" + repo + "/releases/tags/" + urllib.parse.quote(tag, safe=""), timeout=60)
+              assets = release.get("assets") or []
+              match = next((a for a in assets if a.get("name") == asset_name and a.get("browser_download_url")), None)
+              if not match:
+                  raise RuntimeError("Official release asset was not found: " + repo + " " + tag + " / " + asset_name)
+              return download(match["browser_download_url"], dest, timeout=timeout)
+
+          def safe_zip_extract(zip_path, destination, wanted=None, strip_prefix=""):
+              destination = pathlib.Path(destination)
+              destination.mkdir(parents=True, exist_ok=True)
+              extracted = []
+              with zipfile.ZipFile(zip_path) as zf:
+                  for info in zf.infolist():
+                      name = info.filename.replace("\\", "/")
+                      if wanted is not None and name not in wanted:
+                          continue
+                      relative = name
+                      if strip_prefix and relative.startswith(strip_prefix):
+                          relative = relative[len(strip_prefix):]
+                      relative = relative.lstrip("/")
+                      if not relative or relative.endswith("/"):
+                          continue
+                      target = (destination / relative).resolve()
+                      if destination.resolve() not in target.parents:
+                          raise RuntimeError("Unsafe ZIP path in official asset: " + name)
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      with zf.open(info) as src, open(target, "wb") as dst:
+                          shutil.copyfileobj(src, dst)
+                      extracted.append(target)
+              return extracted
+
+          def ensure_java25(base):
+              try:
+                  out = run(["java", "-version"], timeout=30)
+                  if re.search(r'version [\"\']25(?:[.\"\'])', out):
+                      return "java", out.strip().splitlines()[0][:220]
+              except Exception:
+                  pass
+              archive = pathlib.Path(base) / "temurin25.tar.gz"
+              download("https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse", archive, timeout=600)
+              jdk_root = pathlib.Path(base) / "jdk25"
+              jdk_root.mkdir(parents=True, exist_ok=True)
+              with tarfile.open(archive, "r:gz") as tf:
+                  try:
+                      tf.extractall(jdk_root, filter="data")
+                  except TypeError:
+                      for member in tf.getmembers():
+                          target = (jdk_root / member.name).resolve()
+                          if jdk_root.resolve() not in target.parents and target != jdk_root.resolve():
+                              raise RuntimeError("Unsafe TAR path in JDK archive")
+                      tf.extractall(jdk_root)
+              candidates = list(jdk_root.glob("*/bin/java"))
+              if not candidates:
+                  raise RuntimeError("Temurin JDK 25 archive did not contain bin/java")
+              java = str(candidates[0])
+              out = run([java, "-version"], timeout=30)
+              if not re.search(r'version [\"\']25(?:[.\"\'])', out):
+                  raise RuntimeError("Managed Defold adapter requires Java 25; installed runtime did not report Java 25")
+              return java, out.strip().splitlines()[0][:220]
+
+          def hash_selected(paths):
+              return [sha_artifact(path) for path in paths if pathlib.Path(path).exists()]
 
           task = os.environ.get("PS_QA_TASK", "connection").strip() or "connection"
           nonce = os.environ.get("PS_QA_REQUEST_NONCE", "").strip()
@@ -126,7 +212,7 @@ jobs:
           job_id = os.environ.get("PS_QA_JOB_ID", "").strip()
           engine = os.environ.get("PS_QA_ENGINE", "").strip()
           version = os.environ.get("PS_QA_VERSION", "").strip()
-          if not re.fullmatch(r"[a-f0-9]{32}", job_id) or engine not in {"emscripten", "rust"} or not re.fullmatch(r"[0-9A-Za-z._+\-]{1,80}", version):
+          if not re.fullmatch(r"[a-f0-9]{32}", job_id) or engine not in {"emscripten", "rust", "godot", "defold"} or not re.fullmatch(r"[0-9A-Za-z._+\-]{1,80}", version):
               raise SystemExit("Invalid managed QA dispatch inputs")
 
           checks = []
@@ -198,6 +284,129 @@ jobs:
                   checks.append({"name":"Generated Wasm execution","status":"pass","message":"Node instantiated the Rust module and ps_add(19,23) returned 42."})
                   artifacts.append(sha_artifact(wasm))
                   summary = "Rust " + toolchain_version + " installed; wasm32-unknown-unknown fixture compiled and executed successfully."
+
+
+              elif engine == "godot":
+                  tag = version + "-stable"
+                  godot_zip = out_dir / ("Godot_v" + version + "-stable_linux.x86_64.zip")
+                  templates_tpz = out_dir / ("Godot_v" + version + "-stable_export_templates.tpz")
+                  github_release_asset("godotengine/godot-builds", tag, godot_zip.name, godot_zip, timeout=600)
+                  github_release_asset("godotengine/godot-builds", tag, templates_tpz.name, templates_tpz, timeout=1800)
+
+                  engine_dir = out_dir / "godot-engine"
+                  extracted = safe_zip_extract(godot_zip, engine_dir)
+                  godot_candidates = [x for x in extracted if x.name.startswith("Godot_v") and "linux.x86_64" in x.name]
+                  if not godot_candidates:
+                      raise RuntimeError("Official Godot Linux archive did not contain the expected x86_64 editor binary")
+                  godot = godot_candidates[0]
+                  godot.chmod(0o755)
+                  version_out = run([str(godot), "--version"], timeout=60)
+                  m = re.search(r"(\d+\.\d+(?:\.\d+)?)", version_out)
+                  toolchain_version = m.group(1) if m else version
+                  checks.append({"name":"Exact Godot engine installed","status":"pass","message":version_out.strip()[:260]})
+
+                  template_dir = pathlib.Path.home() / ".local" / "share" / "godot" / "export_templates" / (version + ".stable")
+                  wanted = {
+                      "templates/web_nothreads_release.zip",
+                      "templates/web_release.zip",
+                      "templates/version.txt",
+                  }
+                  got = safe_zip_extract(templates_tpz, template_dir, wanted=wanted, strip_prefix="templates/")
+                  got_names = {x.name for x in got}
+                  if not {"web_nothreads_release.zip", "web_release.zip"}.issubset(got_names):
+                      raise RuntimeError("Godot export-template package did not contain both non-threaded and threaded Web release templates")
+                  checks.append({"name":"Godot Web export templates installed","status":"pass","message":"Installed exact-version non-threaded and threaded Web release templates."})
+
+                  project = out_dir / "godot-project"
+                  project.mkdir(parents=True, exist_ok=True)
+                  (project / "project.godot").write_text('; ProfoundSyntax Stage 8E2 managed Godot QA\nconfig_version=5\n\n[application]\nconfig/name="ProfoundSyntax Managed Godot QA"\nrun/main_scene="res://main.tscn"\n\n[display]\n\n[display/window]\nsize/viewport_width=640\nsize/viewport_height=360\n\n[rendering]\nrenderer/rendering_method="gl_compatibility"\nrenderer/rendering_method.mobile="gl_compatibility"\n', encoding="utf-8")
+                  (project / "main.tscn").write_text('[gd_scene load_steps=2 format=3]\n\n[ext_resource type="Script" path="res://main.gd" id="1"]\n\n[node name="Main" type="Node"]\nscript = ExtResource("1")\n', encoding="utf-8")
+                  (project / "main.gd").write_text('extends Node\n\nfunc _thread_probe() -> int:\n    return 42\n\nfunc _ready() -> void:\n    var thread := Thread.new()\n    var err := thread.start(Callable(self, "_thread_probe"))\n    if err != OK:\n        push_error("PS_QA_GODOT_THREAD_START_FAIL")\n        get_tree().quit(2)\n        return\n    var result = thread.wait_to_finish()\n    if int(result) != 42:\n        push_error("PS_QA_GODOT_THREAD_RESULT_FAIL")\n        get_tree().quit(3)\n        return\n    print("PS_QA_GODOT_PASS")\n    get_tree().quit(0)\n', encoding="utf-8")
+                  (project / "export_presets.cfg").write_text('[preset.0]\n\nname="Web"\nplatform="Web"\nrunnable=true\nadvanced_options=true\ndedicated_server=false\ncustom_features=""\nexport_filter="all_resources"\ninclude_filter=""\nexclude_filter=""\nexport_path="export-web/index.html"\npatches=PackedStringArray()\nencryption_include_filters=""\nencryption_exclude_filters=""\nseed=0\nencrypt_pck=false\nencrypt_directory=false\nscript_export_mode=2\n\n[preset.0.options]\n\ncustom_template/debug=""\ncustom_template/release=""\nvariant/extensions_support=false\nvariant/thread_support=false\nvram_texture_compression/for_desktop=true\nvram_texture_compression/for_mobile=true\nhtml/export_icon=true\nhtml/custom_html_shell=""\nhtml/head_include=""\nhtml/canvas_resize_policy=2\nhtml/focus_canvas_on_start=true\nhtml/experimental_virtual_keyboard=false\nprogressive_web_app/enabled=false\nprogressive_web_app/ensure_cross_origin_isolation_headers=false\nprogressive_web_app/offline_page=""\nprogressive_web_app/display=0\nprogressive_web_app/orientation=0\nprogressive_web_app/icon_144x144=""\nprogressive_web_app/icon_180x180=""\nprogressive_web_app/icon_512x512=""\nprogressive_web_app/background_color=Color(0, 0, 0, 1)\n\n[preset.1]\n\nname="Web Threaded"\nplatform="Web"\nrunnable=false\nadvanced_options=true\ndedicated_server=false\ncustom_features=""\nexport_filter="all_resources"\ninclude_filter=""\nexclude_filter=""\nexport_path="export-threaded/index.html"\npatches=PackedStringArray()\nencryption_include_filters=""\nencryption_exclude_filters=""\nseed=0\nencrypt_pck=false\nencrypt_directory=false\nscript_export_mode=2\n\n[preset.1.options]\n\ncustom_template/debug=""\ncustom_template/release=""\nvariant/extensions_support=false\nvariant/thread_support=true\nvram_texture_compression/for_desktop=true\nvram_texture_compression/for_mobile=true\nhtml/export_icon=true\nhtml/custom_html_shell=""\nhtml/head_include=""\nhtml/canvas_resize_policy=2\nhtml/focus_canvas_on_start=true\nhtml/experimental_virtual_keyboard=false\nprogressive_web_app/enabled=false\nprogressive_web_app/ensure_cross_origin_isolation_headers=false\nprogressive_web_app/offline_page=""\nprogressive_web_app/display=0\nprogressive_web_app/orientation=0\nprogressive_web_app/icon_144x144=""\nprogressive_web_app/icon_180x180=""\nprogressive_web_app/icon_512x512=""\nprogressive_web_app/background_color=Color(0, 0, 0, 1)\n', encoding="utf-8")
+
+                  native = run([str(godot), "--headless", "--path", str(project), "--quit-after", "10"], timeout=180)
+                  if "PS_QA_GODOT_PASS" not in native:
+                      raise RuntimeError("Godot native/headless fixture did not reach the deterministic Thread.start/join PASS marker")
+                  checks.append({"name":"Godot engine fixture execution","status":"pass","message":"Headless engine executed the deterministic project and Thread.start/join returned 42."})
+
+                  web_dir = project / "export-web"
+                  threaded_dir = project / "export-threaded"
+                  web_dir.mkdir(parents=True, exist_ok=True)
+                  threaded_dir.mkdir(parents=True, exist_ok=True)
+                  run([str(godot), "--headless", "--path", str(project), "--export-release", "Web", str(web_dir / "index.html")], timeout=600)
+                  run([str(godot), "--headless", "--path", str(project), "--export-release", "Web Threaded", str(threaded_dir / "index.html")], timeout=600)
+
+                  def inspect_godot_bundle(folder, threaded):
+                      wasm_files = list(pathlib.Path(folder).glob("*.wasm"))
+                      js_files = list(pathlib.Path(folder).glob("*.js"))
+                      if not (pathlib.Path(folder) / "index.html").exists() or not wasm_files or not js_files:
+                          raise RuntimeError("Godot Web export is missing index.html, JavaScript, or WebAssembly output")
+                      for wf in wasm_files:
+                          verify_wasm(wf)
+                      js_text = "\n".join(x.read_text(encoding="utf-8", errors="ignore") for x in js_files)
+                      has_thread_marker = ("GODOT_THREADS_ENABLED = true" in js_text or "ENVIRONMENT_IS_PTHREAD" in js_text or ("PThread" in js_text and "SharedArrayBuffer" in js_text))
+                      if threaded and not has_thread_marker:
+                          raise RuntimeError("Godot threaded Web export is missing the expected current/legacy pthread marker set")
+                      if not threaded and "GODOT_THREADS_ENABLED = true" in js_text:
+                          raise RuntimeError("Godot non-threaded Web export unexpectedly advertises GODOT_THREADS_ENABLED=true")
+                      return js_files, wasm_files
+
+                  web_js, web_wasm = inspect_godot_bundle(web_dir, False)
+                  threaded_js, threaded_wasm = inspect_godot_bundle(threaded_dir, True)
+                  checks.append({"name":"Godot Web export","status":"pass","message":"Generated a valid non-threaded Web bundle for godot-web."})
+                  checks.append({"name":"Godot Web Threads export","status":"pass","message":"Generated valid WebAssembly plus pthread/SharedArrayBuffer markers for godot-threaded-web."})
+                  checks.append({"name":"Browser isolation execution","status":"info","message":"Stage 8E2 verifies exact-version Godot exports and threaded markers; hosted-browser COOP/COEP execution remains covered by the accepted Runtime profile regression suite."})
+                  artifacts.extend(hash_selected([web_dir / "index.html", web_js[0], web_wasm[0], threaded_dir / "index.html", threaded_js[0], threaded_wasm[0]]))
+                  summary = "Godot " + toolchain_version + " installed; deterministic engine fixture executed and non-threaded/threaded Web exports validated successfully."
+
+              elif engine == "defold":
+                  java, java_label = ensure_java25(out_dir)
+                  checks.append({"name":"Defold build Java runtime","status":"pass","message":java_label})
+                  bob = out_dir / "bob.jar"
+                  github_release_asset("defold/defold", version, "bob.jar", bob, timeout=600)
+                  version_out = run([java, "-jar", str(bob), "--version"], timeout=120)
+                  m = re.search(r"(\d+\.\d+\.\d+)", version_out)
+                  toolchain_version = m.group(1) if m else version
+                  checks.append({"name":"Exact Defold Bob installed","status":"pass","message":version_out.strip()[:260]})
+
+                  project = out_dir / "defold-project"
+                  (project / "main").mkdir(parents=True, exist_ok=True)
+                  (project / "game.project").write_text('[project]\ntitle = ProfoundSyntax Managed Defold QA\nversion = 1.0\n\n[bootstrap]\nmain_collection = /main/main.collectionc\n\n[display]\nwidth = 640\nheight = 360\nhigh_dpi = 1\n\n[html5]\nscale_mode = stretch\n\n[input]\ngame_binding = /builtins/input/all.input_bindingc\n', encoding="utf-8")
+                  (project / "main" / "main.collection").write_text('name: "main"\nscale_along_z: 0\nembedded_instances {\n  id: "qa"\n  data: "components {\\n"\n  "  id: \\"main\\"\\n"\n  "  component: \\"/main/main.script\\"\\n"\n  "}\\n"\n  ""\n}\n', encoding="utf-8")
+                  (project / "main" / "main.script").write_text('function init(self)\n    print("ProfoundSyntax Stage 8E2 Defold Managed QA")\n    print("PASS - Defold script initialized")\n    timer.delay(0.25, false, function()\n        print("PASS - Defold main loop/timer executed")\n    end)\nend\n', encoding="utf-8")
+
+                  def build_defold(arch, dest):
+                      dest.mkdir(parents=True, exist_ok=True)
+                      run([java, "-jar", str(bob), "--archive", "--platform", "wasm-web", "--architectures", arch, "--variant", "release", "--bundle-output", str(dest), "resolve", "distclean", "build", "bundle"], cwd=str(project), timeout=1500)
+                      files = [x for x in dest.rglob("*") if x.is_file()]
+                      wasm_files = [x for x in files if x.suffix.lower() == ".wasm"]
+                      js_files = [x for x in files if x.suffix.lower() == ".js"]
+                      html_files = [x for x in files if x.suffix.lower() == ".html"]
+                      if not wasm_files or not js_files or not html_files:
+                          raise RuntimeError("Defold " + arch + " bundle is missing HTML, JavaScript, or WebAssembly output")
+                      for wf in wasm_files:
+                          verify_wasm(wf)
+                      for jf in js_files[:2]:
+                          run(["node", "--check", str(jf)], timeout=120)
+                      return files, js_files, wasm_files, html_files
+
+                  normal_dir = out_dir / "defold-wasm-web"
+                  threaded_dir = out_dir / "defold-wasm-pthread-web"
+                  normal_files, normal_js, normal_wasm, normal_html = build_defold("wasm-web", normal_dir)
+                  threaded_files, threaded_js, threaded_wasm, threaded_html = build_defold("wasm_pthread-web", threaded_dir)
+                  normal_names = " ".join(x.name.lower() for x in normal_files)
+                  threaded_names = " ".join(x.name.lower() for x in threaded_files)
+                  threaded_text = "\n".join(x.read_text(encoding="utf-8", errors="ignore") for x in threaded_js)
+                  if "pthread" in normal_names:
+                      raise RuntimeError("Defold ordinary wasm-web bundle unexpectedly contains pthread-named engine artifacts")
+                  if "pthread" not in threaded_names and not any(marker in threaded_text for marker in ("PThread", "SharedArrayBuffer", "wasm_pthread")):
+                      raise RuntimeError("Defold wasm_pthread-web bundle is missing pthread engine names/markers")
+                  checks.append({"name":"Defold wasm-web bundle","status":"pass","message":"Bob generated a valid ordinary HTML5 WebAssembly bundle for defold-wasm-web."})
+                  checks.append({"name":"Defold wasm_pthread-web bundle","status":"pass","message":"Bob generated valid pthread WebAssembly/JavaScript artifacts for defold-threaded-web."})
+                  checks.append({"name":"Generated JavaScript syntax","status":"pass","message":"Node syntax-checked generated Defold engine JavaScript for both Web architectures."})
+                  checks.append({"name":"Browser isolation execution","status":"info","message":"Stage 8E2 validates exact-version Defold bundle generation and pthread markers; hosted-browser COOP/COEP execution remains covered by the accepted Runtime profile regression suite."})
+                  artifacts.extend(hash_selected([normal_html[0], normal_js[0], normal_wasm[0], threaded_html[0], threaded_js[0], threaded_wasm[0]]))
+                  summary = "Defold " + toolchain_version + " installed; wasm-web and wasm_pthread-web bundles generated and validated successfully."
           except Exception as exc:
               status = "failed"
               msg = str(exc).replace("\n", " ")[-350:]
