@@ -3,9 +3,29 @@ name: ProfoundSyntax Managed QA Builder
 on:
   workflow_dispatch:
     inputs:
+      task:
+        description: ProfoundSyntax managed QA task
+        required: false
+        default: connection
+        type: string
       request_nonce:
-        description: ProfoundSyntax one-time connection nonce
+        description: ProfoundSyntax one-time request nonce
         required: true
+        type: string
+      job_id:
+        description: ProfoundSyntax compatibility job ID
+        required: false
+        default: ''
+        type: string
+      engine:
+        description: Managed adapter key
+        required: false
+        default: ''
+        type: string
+      version:
+        description: Exact upstream version under QA
+        required: false
+        default: ''
         type: string
 
 permissions:
@@ -13,56 +33,196 @@ permissions:
   id-token: write
 
 jobs:
-  connection-handshake:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  managed-qa:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
-      - name: Verify ProfoundSyntax managed builder connection
+      - name: Run ProfoundSyntax managed QA
         shell: bash
         env:
+          PS_QA_TASK: ${{ inputs.task }}
           PS_QA_REQUEST_NONCE: ${{ inputs.request_nonce }}
+          PS_QA_JOB_ID: ${{ inputs.job_id }}
+          PS_QA_ENGINE: ${{ inputs.engine }}
+          PS_QA_VERSION: ${{ inputs.version }}
         run: |
           python3 - <<'PY'
+          import hashlib
           import json
           import os
+          import pathlib
+          import re
+          import shutil
+          import subprocess
+          import tempfile
           import urllib.parse
           import urllib.request
 
-          callback = "https://profoundsyntax.com/wp-json/profoundsyntax-community/v1/qa-builder/v2/managed/github/handshake"
+          handshake_url = "https://profoundsyntax.com/wp-json/profoundsyntax-community/v1/qa-builder/v2/managed/github/handshake"
+          result_url = "https://profoundsyntax.com/wp-json/profoundsyntax-community/v1/qa-builder/v2/managed/github/result"
           audience = "profoundsyntax-qa-builder"
-          token_url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
-          token_auth = os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
-          separator = "&" if "?" in token_url else "?"
-          request = urllib.request.Request(
-              token_url + separator + "audience=" + urllib.parse.quote(audience, safe=""),
-              headers={"Authorization": "Bearer " + token_auth},
-          )
-          with urllib.request.urlopen(request, timeout=30) as response:
-              oidc = json.load(response)["value"]
+
+          def get_oidc():
+              token_url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+              token_auth = os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
+              separator = "&" if "?" in token_url else "?"
+              request = urllib.request.Request(
+                  token_url + separator + "audience=" + urllib.parse.quote(audience, safe=""),
+                  headers={"Authorization": "Bearer " + token_auth},
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)["value"]
+
+          def post_json(url, payload, oidc):
+              body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+              req = urllib.request.Request(
+                  url,
+                  data=body,
+                  method="POST",
+                  headers={
+                      "Authorization": "Bearer " + oidc,
+                      "Content-Type": "application/json",
+                      "User-Agent": "ProfoundSyntax-Managed-QA/2.0",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=45) as response:
+                  return json.load(response)
+
+          def run(cmd, cwd=None, env=None, timeout=1200):
+              cp = subprocess.run(cmd, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+              if cp.returncode != 0:
+                  raise RuntimeError("Command failed: " + " ".join(cmd) + "\n" + cp.stdout[-4000:])
+              return cp.stdout
+
+          def sha_artifact(path):
+              data = pathlib.Path(path).read_bytes()
+              return {"name": pathlib.Path(path).name, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+
+          def verify_wasm(path):
+              data = pathlib.Path(path).read_bytes()
+              if len(data) < 8 or data[:4] != b"\\x00asm":
+                  raise RuntimeError("Generated artifact is not a WebAssembly module")
+
+          task = os.environ.get("PS_QA_TASK", "connection").strip() or "connection"
+          nonce = os.environ.get("PS_QA_REQUEST_NONCE", "").strip()
+          if task == "connection":
+              oidc = get_oidc()
+              payload = {
+                  "request_nonce": nonce,
+                  "runner_os": os.environ.get("RUNNER_OS", ""),
+                  "runner_arch": os.environ.get("RUNNER_ARCH", ""),
+                  "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                  "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+                  "workflow": os.environ.get("GITHUB_WORKFLOW", ""),
+                  "sha": os.environ.get("GITHUB_SHA", ""),
+              }
+              result = post_json(handshake_url, payload, oidc)
+              if not result.get("ok"):
+                  raise SystemExit("ProfoundSyntax managed-builder handshake was rejected")
+              print("ProfoundSyntax managed-builder handshake: PASS")
+              raise SystemExit(0)
+
+          job_id = os.environ.get("PS_QA_JOB_ID", "").strip()
+          engine = os.environ.get("PS_QA_ENGINE", "").strip()
+          version = os.environ.get("PS_QA_VERSION", "").strip()
+          if not re.fullmatch(r"[a-f0-9]{32}", job_id) or engine not in {"emscripten", "rust"} or not re.fullmatch(r"[0-9A-Za-z._+\-]{1,80}", version):
+              raise SystemExit("Invalid managed QA dispatch inputs")
+
+          checks = []
+          artifacts = []
+          status = "passed"
+          summary = ""
+          toolchain_version = ""
+          out_dir = pathlib.Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())) / ("profoundsyntax-qa-" + job_id)
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          try:
+              if engine == "emscripten":
+                  sdk = out_dir / "emsdk"
+                  run(["git", "clone", "--depth", "1", "https://github.com/emscripten-core/emsdk.git", str(sdk)], timeout=300)
+                  run([str(sdk / "emsdk"), "install", version], cwd=str(sdk), timeout=1500)
+                  run([str(sdk / "emsdk"), "activate", version], cwd=str(sdk), timeout=300)
+                  env_cmd = "source ./emsdk_env.sh >/dev/null && emcc --version"
+                  version_out = run(["bash", "-lc", env_cmd], cwd=str(sdk), timeout=120)
+                  m = re.search(r"\b(\d+\.\d+\.\d+)\b", version_out)
+                  toolchain_version = m.group(1) if m else version
+                  checks.append({"name":"Exact Emscripten SDK installed","status":"pass","message":"emcc reports " + toolchain_version})
+
+                  c_file = out_dir / "fixture.c"
+                  c_file.write_text("int ps_add(int a, int b) { return a + b; }\n", encoding="utf-8")
+                  wasm = out_dir / "emscripten-fixture.wasm"
+                  compile_cmd = "source " + str(sdk / "emsdk_env.sh") + " >/dev/null && emcc " + str(c_file) + " -O2 -sSTANDALONE_WASM -Wl,--no-entry -sEXPORTED_FUNCTIONS=_ps_add -o " + str(wasm)
+                  run(["bash", "-lc", compile_cmd], timeout=300)
+                  verify_wasm(wasm)
+                  checks.append({"name":"Non-threaded WebAssembly build","status":"pass","message":"Generated valid Wasm for emscripten-wasm."})
+
+                  node_test = "const fs=require('fs'); WebAssembly.instantiate(fs.readFileSync(process.argv[1]),{}).then(x=>{const init=x.instance.exports._initialize;if(init)init();const f=x.instance.exports._ps_add||x.instance.exports.ps_add;if(!f||f(19,23)!==42)process.exit(3); console.log('42')}).catch(()=>process.exit(4));"
+                  run(["node", "-e", node_test, str(wasm)], timeout=120)
+                  checks.append({"name":"Generated Wasm execution","status":"pass","message":"Node instantiated the module and ps_add(19,23) returned 42."})
+                  artifacts.append(sha_artifact(wasm))
+
+                  pthread_c = out_dir / "pthread.c"
+                  pthread_c.write_text("#include <pthread.h>\nstatic void* worker(void* p){return p;}\nint main(){pthread_t t; if(pthread_create(&t,0,worker,0)) return 2; pthread_join(t,0); return 0;}\n", encoding="utf-8")
+                  pthread_html = out_dir / "emscripten-pthread.html"
+                  pthread_cmd = "source " + str(sdk / "emsdk_env.sh") + " >/dev/null && emcc " + str(pthread_c) + " -O2 -pthread -sPTHREAD_POOL_SIZE=1 -sEXIT_RUNTIME=1 -o " + str(pthread_html)
+                  run(["bash", "-lc", pthread_cmd], timeout=300)
+                  pthread_js = out_dir / "emscripten-pthread.js"
+                  pthread_wasm = out_dir / "emscripten-pthread.wasm"
+                  if not pthread_js.exists() or not pthread_wasm.exists():
+                      raise RuntimeError("Threaded Emscripten build did not emit expected JavaScript/Wasm artifacts")
+                  js_text = pthread_js.read_text(encoding="utf-8", errors="ignore")
+                  if not any(marker in js_text for marker in ("PThread", "SharedArrayBuffer", "ENVIRONMENT_IS_PTHREAD")):
+                      raise RuntimeError("Threaded Emscripten output is missing pthread/SharedArrayBuffer markers")
+                  verify_wasm(pthread_wasm)
+                  checks.append({"name":"Threaded artifact generation","status":"pass","message":"Generated pthread JavaScript/Wasm markers for emscripten-pthreads."})
+                  checks.append({"name":"Browser isolation execution","status":"info","message":"Stage 8E1 validates pthread artifact generation; hosted-browser COOP/COEP execution remains covered by the accepted Runtime profile regression suite."})
+                  artifacts.extend([sha_artifact(pthread_js), sha_artifact(pthread_wasm)])
+                  summary = "Emscripten " + toolchain_version + " installed; non-threaded Wasm compiled/executed and pthread artifacts generated successfully."
+
+              elif engine == "rust":
+                  run(["rustup", "toolchain", "install", version, "--profile", "minimal"], timeout=900)
+                  run(["rustup", "target", "add", "--toolchain", version, "wasm32-unknown-unknown"], timeout=600)
+                  version_out = run(["rustc", "+" + version, "--version"], timeout=120)
+                  m = re.search(r"rustc\s+(\d+\.\d+\.\d+)", version_out)
+                  toolchain_version = m.group(1) if m else version
+                  checks.append({"name":"Exact Rust toolchain installed","status":"pass","message":version_out.strip()[:260]})
+                  rust_file = out_dir / "fixture.rs"
+                  rust_file.write_text('#[no_mangle]\npub extern "C" fn ps_add(a:i32,b:i32)->i32{a+b}\n', encoding="utf-8")
+                  wasm = out_dir / "rust-fixture.wasm"
+                  run(["rustc", "+" + version, "--target", "wasm32-unknown-unknown", "--crate-type=cdylib", "-C", "opt-level=2", str(rust_file), "-o", str(wasm)], timeout=300)
+                  verify_wasm(wasm)
+                  checks.append({"name":"Rust WebAssembly build","status":"pass","message":"Generated valid wasm32-unknown-unknown module for rust-wasm."})
+                  node_test = "const fs=require('fs'); WebAssembly.instantiate(fs.readFileSync(process.argv[1]),{}).then(x=>{const f=x.instance.exports.ps_add;if(!f||f(19,23)!==42)process.exit(3); console.log('42')}).catch(e=>{console.error(e);process.exit(4)});"
+                  run(["node", "-e", node_test, str(wasm)], timeout=120)
+                  checks.append({"name":"Generated Wasm execution","status":"pass","message":"Node instantiated the Rust module and ps_add(19,23) returned 42."})
+                  artifacts.append(sha_artifact(wasm))
+                  summary = "Rust " + toolchain_version + " installed; wasm32-unknown-unknown fixture compiled and executed successfully."
+          except Exception as exc:
+              status = "failed"
+              msg = str(exc).replace("\n", " ")[-350:]
+              checks.append({"name":"Managed adapter execution","status":"fail","message":msg})
+              summary = engine + " " + version + " automated compatibility QA failed: " + msg
 
           payload = {
-              "request_nonce": os.environ.get("PS_QA_REQUEST_NONCE", ""),
+              "request_nonce": nonce,
+              "job_id": job_id,
+              "engine": engine,
+              "version": version,
+              "toolchain_version": toolchain_version,
+              "status": status,
+              "summary": summary,
+              "checks": checks,
+              "artifacts": artifacts,
               "runner_os": os.environ.get("RUNNER_OS", ""),
               "runner_arch": os.environ.get("RUNNER_ARCH", ""),
               "run_id": os.environ.get("GITHUB_RUN_ID", ""),
               "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
-              "workflow": os.environ.get("GITHUB_WORKFLOW", ""),
               "sha": os.environ.get("GITHUB_SHA", ""),
           }
-          body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-          callback_request = urllib.request.Request(
-              callback,
-              data=body,
-              method="POST",
-              headers={
-                  "Authorization": "Bearer " + oidc,
-                  "Content-Type": "application/json",
-                  "User-Agent": "ProfoundSyntax-Managed-QA/1.0",
-              },
-          )
-          with urllib.request.urlopen(callback_request, timeout=30) as response:
-              result = json.load(response)
+          result = post_json(result_url, payload, get_oidc())
           if not result.get("ok"):
-              raise SystemExit("ProfoundSyntax managed-builder handshake was rejected")
-          print("ProfoundSyntax managed-builder handshake: PASS")
+              raise SystemExit("ProfoundSyntax managed QA result was rejected")
+          print("ProfoundSyntax managed QA result submitted: " + status.upper())
+          if status == "failed":
+              raise SystemExit(1)
           PY
