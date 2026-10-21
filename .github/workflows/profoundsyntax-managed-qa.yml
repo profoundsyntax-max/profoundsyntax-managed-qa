@@ -306,16 +306,20 @@ jobs:
                   checks.append({"name":"Exact Godot engine installed","status":"pass","message":version_out.strip()[:260]})
 
                   template_dir = pathlib.Path.home() / ".local" / "share" / "godot" / "export_templates" / (version + ".stable")
-                  wanted = {
-                      "templates/web_nothreads_release.zip",
-                      "templates/web_release.zip",
-                      "templates/version.txt",
+                  required_web_templates = {
+                      "web_nothreads_debug.zip",
+                      "web_nothreads_release.zip",
+                      "web_debug.zip",
+                      "web_release.zip",
                   }
+                  wanted = {"templates/" + name for name in required_web_templates}
+                  wanted.add("templates/version.txt")
                   got = safe_zip_extract(templates_tpz, template_dir, wanted=wanted, strip_prefix="templates/")
                   got_names = {x.name for x in got}
-                  if not {"web_nothreads_release.zip", "web_release.zip"}.issubset(got_names):
-                      raise RuntimeError("Godot export-template package did not contain both non-threaded and threaded Web release templates")
-                  checks.append({"name":"Godot Web export templates installed","status":"pass","message":"Installed exact-version non-threaded and threaded Web release templates."})
+                  missing_web_templates = sorted(required_web_templates - got_names)
+                  if missing_web_templates:
+                      raise RuntimeError("Godot export-template package is missing required Web templates: " + ", ".join(missing_web_templates))
+                  checks.append({"name":"Godot Web export templates installed","status":"pass","message":"Installed exact-version complete Web template set: non-threaded debug/release and threaded debug/release."})
 
                   project = out_dir / "godot-project"
                   project.mkdir(parents=True, exist_ok=True)
