@@ -100,8 +100,9 @@ jobs:
 
           def verify_wasm(path):
               data = pathlib.Path(path).read_bytes()
-              if len(data) < 8 or data[:4] != b"\\x00asm":
-                  raise RuntimeError("Generated artifact is not a WebAssembly module")
+              if len(data) < 8 or data[:4] != b"\x00asm":
+                  sample = data[:12].hex() if data else "empty"
+                  raise RuntimeError("Generated artifact is not a WebAssembly module (bytes=" + str(len(data)) + ", head=" + sample + ")")
 
           task = os.environ.get("PS_QA_TASK", "connection").strip() or "connection"
           nonce = os.environ.get("PS_QA_REQUEST_NONCE", "").strip()
